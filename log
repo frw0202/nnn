@@ -1,0 +1,274 @@
+import numpy as np
+import json
+from typing import List, Dict, Any, Tuple
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import pairwise_distances
+from collections import Counter
+import math
+from collections import Counter
+from sklearn.metrics import precision_score, recall_score, f1_score
+import random
+
+
+def compute_squared_EDM_method(X: np.ndarray) -> np.ndarray:
+    """
+    Compute the squared Euclidean Distance Matrix.
+
+    Args:
+        X (np.ndarray): Input matrix
+
+    Returns:
+        np.ndarray: Squared Euclidean Distance Matrix
+    """
+    return np.sum(X**2, axis=1)[:, np.newaxis] + np.sum(X**2, axis=1) - 2 * np.dot(X, X.T)
+
+
+def get_logcluster_result(train_set: np.ndarray, n_clusters: int = 45) -> Tuple[List[int], np.ndarray]:
+    """
+    Perform clustering on the training set.
+
+    Args:
+        train_set (np.ndarray): Training data set
+        n_clusters (int): Number of clusters to form
+
+    Returns:
+        Tuple[List[int], np.ndarray]: Cluster centroids and cluster results
+    """
+    # Calculate distance matrix
+    distance_matrix = pairwise_distances(train_set, metric='cosine')
+    
+    # Perform clustering
+    hier = AgglomerativeClustering(n_clusters=n_clusters, linkage="complete")
+    cluster_ = hier.fit_predict(distance_matrix)
+
+    def get_centroid_index(cluster_embedding):
+        distance_array = np.sum(compute_squared_EDM_method(cluster_embedding), axis=1)
+        return np.argmin(distance_array)
+
+    cluster_centroids = [np.where(cluster_ == i)[0][get_centroid_index(train_set[np.where(cluster_ == i)[0]])] 
+                         for i in range(n_clusters)]
+    
+    return cluster_centroids, cluster_
+
+
+class LogCluster:
+    def __init__(self, log_event_seq: List[List[int]], train_eventId: List[List[int]]):
+        """
+        Initialize the LogCluster class for offline clustering.
+
+        Args:
+            log_event_seq (List[List[int]]): All log event sequences.
+            train_eventId (List[List[int]]): Event IDs for training data.
+        """
+        self.log_event_seq = log_event_seq
+        self.train_eventId = train_eventId
+        self.template_vector = {}
+        self.template_list = []
+        self.train_vector = []
+
+    def get_embedding_dict(self) -> None:
+        """
+        Calculate embedding dictionary for event IDs.
+        """
+        case_all_template_occurrence = [event for eventId_list in self.log_event_seq for event in eventId_list]
+        case_log_template_counter = dict(Counter(case_all_template_occurrence))
+
+        self.template_list = sorted(list(case_log_template_counter.keys()))
+        for template in case_log_template_counter:
+            idf = math.log10(len(self.log_event_seq) / case_log_template_counter[template])
+            value = 0.5 * (1 / (1 + math.exp(-idf)))
+            self.template_vector[template] = value
+
+    def get_train_embedding(self) -> None:
+        """
+        Calculate embedding for training data.
+        """
+        self.train_vector = [[self.template_vector[eventId] if eventId in eventId_list else 0.0 
+                              for eventId in self.template_list] 
+                             for eventId_list in self.train_eventId]
+
+def load_data(file_path: str) -> np.ndarray:
+    """
+    Load log data from a .npy file.
+    """
+    return np.load(file_path, allow_pickle=True)
+
+def load_labels(file_path: str) -> Dict[str, int]:
+    """
+    Load labels from a JSON file.
+    """
+    with open(file_path, 'r') as f:
+        return json.load(f)
+
+def offline_clustering(log_event_seq: List[List[int]], train_eventId: List[List[int]], labels: List[int], n_clusters: int = 45) -> Dict[str, Any]:
+    """
+    Perform offline clustering and prepare for online diagnosis.
+
+    Args:
+        log_event_seq (List[List[int]]): All log event sequences.
+        train_eventId (List[List[int]]): Training event ID sequences.
+        n_clusters (int): Number of clusters to form.
+
+    Returns:
+        Dict[str, Any]: Clustering result including cluster centers and labels.
+    """
+    log_cluster = LogCluster(log_event_seq, train_eventId)
+    log_cluster.get_embedding_dict()
+    log_cluster.get_train_embedding()
+    
+    train_set = np.array(log_cluster.train_vector)
+    train_set = np.nan_to_num(train_set, nan=0, posinf=0, neginf=0)
+
+    ###################################################
+
+    # Get cluster results
+    cluster_centroids, cluster_result = get_logcluster_result(train_set, n_clusters=45)
+
+    # Prepare labels
+    #case_truth_label = np.array([labels[str(i)] for i in range(len(labels))])
+
+    case_truth_label = np.array(labels)
+    classify_index = np.full(len(cluster_result), -1)
+    #print(case_truth_label)
+    for i in range(n_clusters):  # We know there are 9 fault types
+        class_label = case_truth_label[cluster_centroids[i]]
+        classify_index[np.where(cluster_result == i)[0]] = class_label
+
+    # Calculate cluster means
+    cluster_means = [np.mean(train_set[cluster_result == cluster], axis=0) for cluster in range(n_clusters)]
+
+    # Prepare result
+    result = []
+    cluster_list=[]
+    for cluster, mean in enumerate(cluster_means):
+        result.append({
+            "cluster_label": int(cluster),
+            "cluster_mean": mean.tolist(),
+            "fault_type": int(classify_index[np.where(cluster_result == cluster)[0][0]])  # Add fault type
+        })
+    
+    for r in result:
+        cluster_list.append(r['fault_type'])
+        #print(f"Cluster {r['cluster_label']}: Fault Type {r['fault_type']}")
+
+
+    # Perform clustering
+    distance_matrix = pairwise_distances(train_set, metric='cosine')
+    hier = AgglomerativeClustering(n_clusters=n_clusters, linkage="complete")
+    cluster_result = hier.fit_predict(distance_matrix)
+
+    # Calculate cluster centers
+    cluster_centroids = [np.mean(train_set[cluster_result == cluster], axis=0) for cluster in range(n_clusters)]
+
+    return {
+        "cluster_centroids": cluster_centroids,
+        "cluster_result": cluster_result,
+        "template_vector": log_cluster.template_vector,
+        "template_list": log_cluster.template_list,
+    },cluster_list
+
+def online_diagnosis(case_eventId: List[int], template_vector: Dict[int, float], 
+                     template_list: List[int], cluster_centroids: List[List[float]]) -> Dict[str, Any]:
+    """
+    Perform online diagnosis for a single case.
+
+    Args:
+        case_eventId (List[int]): Event IDs for the input case.
+        template_vector (Dict[int, float]): Template embeddings.
+        template_list (List[int]): List of all templates.
+        cluster_centroids (List[List[float]]): Centroids of clusters.
+
+    Returns:
+        Dict[str, Any]: Diagnosis result with closest cluster and distance.
+    """
+    # Generate feature vector for the input case
+    #print(len(template_list))
+    #print(template_list[0])
+    feature_vector = [template_vector[eventId] if eventId in case_eventId else 0.0 for eventId in template_list]
+
+    #print(feature_vector)
+    # Calculate distance to each cluster centroid
+    distances = [np.linalg.norm(np.array(feature_vector) - np.array(centroid)) for centroid in cluster_centroids]
+    #print(distances)
+    closest_cluster = int(np.argmin(distances))
+    min_distance = distances[closest_cluster]
+
+    return {
+        "closest_cluster": closest_cluster,
+        "distance": min_distance,
+    }
+
+
+if __name__ == "__main__":
+    # Offline clustering
+    all_data = load_data('data/zte_data_by_case.npy')
+    labels = load_labels('data/label.json')
+
+    labels = list(labels.values())
+
+    log_sequences = []
+    log_event_seq = []
+    label_seq = []
+    
+    for i in range(0, len(all_data), 1):#20
+        seq_event = sorted(list(set(all_data[i:i+1, 1])))
+        log_event_seq.append(seq_event)
+        log_sequences.append(all_data[i:i+1].tolist())
+        # 使用 Counter 计算频率
+        counter = Counter(labels[i:i+1])
+        # 获取众数（出现次数最多的元素）
+        mode = counter.most_common(1)[0][0]  # most_common(1) 返回一个包含一个元组的列表，取第一个元素
+        label_seq.append(mode)
+
+
+    train_count = int(len(log_sequences) * 0.8)
+    train_eventId = log_event_seq[:train_count]
+
+    clustering_result, cluster_list = offline_clustering(log_event_seq, train_eventId ,labels,9)
+
+    # Online diagnosis
+    print(len(log_event_seq))
+    print(len(label_seq))
+    test_case_eventId = log_event_seq[train_count]  
+    print(label_seq[train_count]) 
+
+    diagnosis = online_diagnosis(
+        test_case_eventId,
+        clustering_result["template_vector"],
+        clustering_result["template_list"],
+        clustering_result["cluster_centroids"]
+    )
+    fault_type = ['BFD Down','Power Supply Fault','STP Fault','CRC Error','Fan Fault','Port Failure','Power Supply Fault','LACP Flapping','Optics Module Fault']
+
+    y_true=label_seq[train_count:]
+    y_pred=[]
+    for log in log_event_seq[train_count:]: 
+        diagnosis = online_diagnosis(
+            log,
+            clustering_result["template_vector"],
+            clustering_result["template_list"],
+            clustering_result["cluster_centroids"]
+        )
+        print(diagnosis)
+        y_pred.append(cluster_list[diagnosis['closest_cluster']])
+    print(y_true)
+    print(y_pred)
+    precision = precision_score(y_true, y_pred, average='weighted')
+    recall = recall_score(y_true, y_pred, average='weighted')
+    f1 = f1_score(y_true, y_pred, average='weighted')
+    macro_f1 = f1_score(y_true, y_pred, average='macro')
+    micro_f1 = f1_score(y_true, y_pred, average='micro')
+
+    
+    print(f"Precision (weighted): {precision:.4f}")
+    print(f"Recall (weighted): {recall:.4f}")
+    print(f"F1 Score (weighted): {f1:.4f}")
+    print(f"Macro F1: {macro_f1:.4f}")
+    print(f"Micro F1: {micro_f1:.4f}")
+
+
+    #print("Online Diagnosis Result:")
+    #print(diagnosis)
+    #print(fault_type[diagnosis['closest_cluster']])
+    
+    #print(dic[diagnosis['closest_cluster']])
